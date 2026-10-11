@@ -265,6 +265,12 @@ export default defineSchema({
     ownerWroteAt: v.optional(v.number()),
     /** False stops Perry updating himself at night (updates.ts). Unset means on. */
     autoUpdate: v.optional(v.boolean()),
+    /**
+     * Experimental: true hides rarely-used tools behind find_tool/call_tool
+     * instead of declaring all of them on every turn (mcp.ts). Unset falls
+     * back to the PERRY_LAZY_TOOLS env var, off otherwise.
+     */
+    lazyTools: v.optional(v.boolean()),
     /** False when the owner turned off waking the computer for jobs and reminders (wake.ts). Unset: on. */
     wake: v.optional(v.boolean()),
     /** The wake timer the server last set, or why it could not, and whether it is keeping the computer awake (server/wake.ts). */

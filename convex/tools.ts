@@ -1227,7 +1227,13 @@ const run_action = createTool({
     "and the arguments its schema asks for. This reaches the owner's real " +
     "accounts: it sends real email, creates real calendar events, and edits " +
     "real documents. Anything that sends, deletes, publishes or spends needs " +
-    "the owner's explicit go-ahead in chat first. Reading does not.",
+    "the owner's explicit go-ahead in chat first. Reading does not. Ask for " +
+    "only what you need: a small page size, a field or filter argument when " +
+    "the action offers one, and (for a raw GraphQL action) a query that " +
+    "selects just the fields you want rather than every field of every item. " +
+    "A broad read costs far more here, and keeps costing it on every later " +
+    "step of this reply; a result over 12,000 characters comes back cut, " +
+    "with a note to ask again more narrowly.",
   inputSchema: z.object({
     slug: z.string().min(1).describe("Exact action slug from find_action."),
     args: z

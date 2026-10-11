@@ -51,7 +51,7 @@ import { ActionButton, CodeDisplay, CommandLine, EmptyState, InfoTip, List, List
  * with the connectors, in Apps & skills.
  */
 const SECTIONS: Record<SettingsSection, () => ReactNode> = {
-  general: () => <><YourAssistant /><Appearance /><BrainArchive /><Updates /></>,
+  general: () => <><YourAssistant /><Appearance /><BrainArchive /><Updates /><ExperimentalTools /></>,
   engines: () => <><UsageMoved /><DefaultEngine /><Engines /></>,
   usage: () => <Usage />,
   computers: () => <Computers />,
@@ -454,6 +454,35 @@ function BrainArchive() {
         </Select>
         <span className="text-sm text-muted-foreground">unused</span>
       </div>
+    </Section>
+  );
+}
+
+/**
+ * Experimental: declares only the tools used most on every turn, and hides
+ * the rest behind find_tool/call_tool, found only when searched for. Trims
+ * the per-turn baseline; worth watching Usage after turning it on.
+ */
+function ExperimentalTools() {
+  const { dashboardKey } = useSession();
+  const enabled = useQuery(api.mcp.getLazySetting, { key: dashboardKey });
+  const setEnabled = useMutation(api.mcp.setLazySetting);
+  return (
+    <Section title="Experimental" tip="Off by default. Changes apply to a chat's next turn, no restart needed.">
+      <label className="flex items-start gap-3 text-sm">
+        <Switch checked={enabled ?? false} disabled={enabled === undefined} className="mt-0.5" aria-label="Lazy tool loading"
+          onCheckedChange={(on) => void setEnabled({ key: dashboardKey, enabled: on }).then(
+            () => toast.success(on ? "Rarely-used tools are now found with find_tool instead of always declared." : "All tools are declared on every turn again."),
+            (cause) => toast.error(errorText(cause)))} />
+        <span>
+          <span className="font-medium">Lazy tool loading</span>
+          <p className="mt-0.5 text-muted-foreground">
+            Declares only the tools used on most turns; the rest (brain editing, secrets, scheduled jobs, notes, page
+            watching, messaging someone else, the Library) are found with find_tool instead of listed every time.
+            Shrinks the fixed per-turn cost; check Settings → Usage after a day to see the difference.
+          </p>
+        </span>
+      </label>
     </Section>
   );
 }

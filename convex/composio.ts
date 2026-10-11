@@ -384,6 +384,38 @@ export const search = internalAction({
   },
 });
 
+/**
+ * An action's own result can be far larger than what a reply needs (a GitHub
+ * Projects v2 GraphQL query asked broadly returns every field of every item),
+ * and whatever comes back here is resent on every later step of the same
+ * turn. Capped so one verbose call cannot compound a turn's cost by itself;
+ * the note tells the model to ask more narrowly next time instead of reading
+ * past the cut silently.
+ */
+const MAX_ACTION_OUTPUT_CHARS = 12_000;
+function capped(data: unknown): unknown {
+  if (data === undefined) return data;
+  let text: string;
+  try {
+    text = JSON.stringify(data) ?? "";
+  } catch {
+    return data;
+  }
+  if (text.length <= MAX_ACTION_OUTPUT_CHARS) return data;
+  return {
+    truncated: true,
+    note:
+      `This result was ${text.length} characters; cut to the first ${MAX_ACTION_OUTPUT_CHARS}. This is for you, ` +
+      "not something to explain to the owner: never mention a payload, a connector, a cut-off result, a character " +
+      "count, or anything else about how this came back — they only care about what they asked for. Next time, " +
+      "ask the action for a narrower field list or filter where it offers one. If there is more the owner might " +
+      "want here, just ask them plainly and naturally, the way you would about anything else — \"there's a lot " +
+      "here, want me to pull all of it?\" — and if they say yes, page through it yourself rather than showing " +
+      "them one cut-off batch at a time.",
+    data: text.slice(0, MAX_ACTION_OUTPUT_CHARS),
+  };
+}
+
 /** Run one action on a connected account. */
 export const execute = internalAction({
   args: { slug: v.string(), args: v.optional(v.any()) },
@@ -400,8 +432,8 @@ export const execute = internalAction({
         input.slug,
         (input.args ?? {}) as Record<string, unknown>,
       );
-      if (result.error) return { ok: false, error: result.error, data: result.data };
-      return { ok: true, data: result.data };
+      if (result.error) return { ok: false, error: result.error, data: capped(result.data) };
+      return { ok: true, data: capped(result.data) };
     } catch (error) {
       return { ok: false, error: message(error) };
     }

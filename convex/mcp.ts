@@ -1,7 +1,10 @@
 import { readFileSync } from "node:fs";
+import { v } from "convex/values";
 import { z } from "zod";
 import { internal } from "./_generated/api";
-import { httpAction } from "./_generated/server";
+import { httpAction, internalQuery, mutation, query, type ActionCtx } from "./_generated/server";
+import type { Id } from "./_generated/dataModel";
+import { assertDashboardKey } from "./lib/auth";
 import { describeError, errorText } from "./lib/errors";
 import { PAUSED_ERROR } from "./lib/commands";
 import { GUEST_TOOLS as GUEST_TOOL_NAMES } from "./lib/engines";
@@ -49,6 +52,96 @@ export const OLD_NAMES: readonly ToolName[] = ["read_memory", "search_memory", "
  * web tools or other chats, so nothing there can reach anything of the owner's.
  */
 export const GUEST_TOOLS: readonly ToolName[] = GUEST_TOOL_NAMES;
+
+/**
+ * Experimental: declare only the tools a turn reaches for often, and hide the
+ * rest behind find_tool/call_tool, found only when searched for. Same idea as
+ * OLD_NAMES above (a name need not be listed to be callable) applied on
+ * purpose instead of as a side effect of history, to see whether the tool
+ * list's own size is worth trimming. Off by default, flipped per-install from
+ * Settings → General (lazyTools below) or PERRY_LAZY_TOOLS=1 when unset, so it
+ * can be measured against ordinary traffic rather than assumed. A tool picked
+ * here from real call counts (the runs table): kept direct because it fires
+ * on most turns; everything else in CODEX_TOOLS but absent here is "lazy" and
+ * found only through find_tool.
+ */
+/** Settings → General's toggle, read by the dashboard; falls back to PERRY_LAZY_TOOLS unset. */
+export const getLazySetting = query({
+  args: { key: v.string() },
+  handler: async (ctx, args): Promise<boolean> => {
+    assertDashboardKey(args.key);
+    const install = await ctx.db.query("installation").first();
+    return install?.lazyTools ?? (process.env.PERRY_LAZY_TOOLS === "1");
+  },
+});
+
+export const setLazySetting = mutation({
+  args: { key: v.string(), enabled: v.boolean() },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    assertDashboardKey(args.key);
+    const install = await ctx.db.query("installation").first();
+    if (!install) throw new Error("Run pnpm run setup first.");
+    await ctx.db.patch(install._id, { lazyTools: args.enabled });
+    return null;
+  },
+});
+
+/** The same setting, for `handle()` below to read without a dashboard key. */
+export const lazyToolsOn = internalQuery({
+  args: {},
+  handler: async (ctx): Promise<boolean> => {
+    const install = await ctx.db.query("installation").first();
+    return install?.lazyTools ?? (process.env.PERRY_LAZY_TOOLS === "1");
+  },
+});
+export const FREQUENT_TOOLS: readonly ToolName[] = [
+  "brain_list", "brain_read", "brain_summarize", "brain_lately", "brain_review",
+  "recall", "remember", "list_secrets",
+  "list_todos", "add_todo", "update_todo", "delete_todo",
+  "list_connectors", "find_action", "run_action",
+  "status_report", "start_task", "finish_task", "set_plan",
+  "browser",
+];
+/** CODEX_TOOLS minus FREQUENT_TOOLS: declared only through find_tool when lazy loading is on. */
+export const LAZY_TOOL_NAMES: readonly ToolName[] = CODEX_TOOLS.filter((name) => !FREQUENT_TOOLS.includes(name));
+
+const FIND_TOOL = {
+  name: "find_tool",
+  description:
+    "Look up a tool by what it does, among the ones not listed directly (brain editing and linking, secrets, " +
+    "identity and skills, chat search, goals, page watching, scheduled jobs, messaging someone other than the " +
+    "owner, and the Library). Returns each match's exact name and arguments; call it with call_tool. Try the " +
+    "direct tools first — this is for the rest.",
+  inputSchema: z.object({
+    query: z.string().min(2).max(200).describe("What you want to do, in a few words, e.g. \"schedule a reminder\" or \"watch a web page for changes\"."),
+  }),
+};
+const CALL_TOOL = {
+  name: "call_tool",
+  description: "Run a tool found with find_tool, by its exact name and arguments.",
+  inputSchema: z.object({
+    name: z.string().min(1).describe("A tool's name, exactly as find_tool returned it."),
+    arguments: z.record(z.string(), z.unknown()).optional().describe("That tool's arguments."),
+  }),
+};
+/** A lazy tool's name and description split into words, for find_tool's overlap score. */
+const LAZY_TOOL_WORDS: ReadonlyMap<ToolName, Set<string>> = new Map(
+  LAZY_TOOL_NAMES.map((name) => {
+    const tool = ALL_TOOLS[name] as unknown as Bindable;
+    const text = `${name.replace(/_/g, " ")} ${tool.description ?? ""}`.toLowerCase();
+    return [name, new Set(text.match(/[a-z][a-z'-]{2,}/g) ?? [])];
+  }),
+);
+/** The lazy tools whose name or description best overlaps a query's words, best first. */
+function findLazyTools(query: string): ToolName[] {
+  const words = new Set((query.toLowerCase().match(/[a-z][a-z'-]{2,}/g) ?? []));
+  const scored = LAZY_TOOL_NAMES
+    .map((name) => ({ name, score: [...words].filter((word) => LAZY_TOOL_WORDS.get(name)!.has(word)).length }))
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score);
+  return (scored.length ? scored : LAZY_TOOL_NAMES.map((name) => ({ name, score: 0 }))).slice(0, 8).map((item) => item.name);
+}
 
 /**
  * Only Codex runs on the machine where its files are, so only Codex can show
@@ -204,6 +297,7 @@ export const handle = httpAction(async (ctx, request) => {
   if (access.paused && message.method === "tools/call") return toolError(message.id, new Error(PAUSED_ERROR));
 
   const tools = access.guest ? GUEST_TOOLS : CODEX_TOOLS;
+  const lazy = access.guest ? false : await ctx.runQuery(internal.mcp.lazyToolsOn, {});
   switch (message.method) {
     case "initialize":
       return reply(message.id, {
@@ -214,10 +308,12 @@ export const handle = httpAction(async (ctx, request) => {
       });
     case "ping":
       return reply(message.id, {});
-    case "tools/list":
+    case "tools/list": {
+      // Lazy mode only thins what is declared; `tools` (the permission check below) stays the full set either way.
+      const declared = lazy ? FREQUENT_TOOLS : tools;
       return reply(message.id, {
         tools: [
-          ...tools.map((name) => {
+          ...declared.map((name) => {
             const tool = ALL_TOOLS[name] as unknown as Bindable;
             return { name, description: tool.description ?? name, inputSchema: z.toJSONSchema(tool.inputSchema) };
           }),
@@ -225,9 +321,14 @@ export const handle = httpAction(async (ctx, request) => {
             { name: SHARE_FILE.name, description: SHARE_FILE.description, inputSchema: z.toJSONSchema(SHARE_FILE.inputSchema) },
             { name: TAKE_LONGER.name, description: TAKE_LONGER.description, inputSchema: z.toJSONSchema(TAKE_LONGER.inputSchema) },
             { name: LOOK_AT_SCREEN.name, description: LOOK_AT_SCREEN.description, inputSchema: z.toJSONSchema(LOOK_AT_SCREEN.inputSchema) },
+            ...(lazy ? [
+              { name: FIND_TOOL.name, description: FIND_TOOL.description, inputSchema: z.toJSONSchema(FIND_TOOL.inputSchema) },
+              { name: CALL_TOOL.name, description: CALL_TOOL.description, inputSchema: z.toJSONSchema(CALL_TOOL.inputSchema) },
+            ] : []),
           ]),
         ],
       });
+    }
     case "tools/call": {
       if (!access.guest && message.params?.name === SHARE_FILE.name) {
         const parsed = SHARE_FILE.inputSchema.safeParse(message.params?.arguments ?? {});
@@ -278,37 +379,62 @@ export const handle = httpAction(async (ctx, request) => {
           return toolError(message.id, error);
         }
       }
-      const name = String(message.params?.name ?? "") as ToolName;
-      if (!tools.includes(name) && (access.guest || !OLD_NAMES.includes(name))) return fail(message.id, -32602, `Unknown tool: ${name}`);
-      const tool = ALL_TOOLS[name] as unknown as Bindable;
-      const parsed = tool.inputSchema.safeParse(message.params?.arguments ?? {});
-      if (!parsed.success) {
-        return reply(message.id, { isError: true, content: [{ type: "text", text: `Invalid arguments: ${parsed.error.message}` }] });
+      if (lazy && !access.guest && message.params?.name === FIND_TOOL.name) {
+        const parsed = FIND_TOOL.inputSchema.safeParse(message.params?.arguments ?? {});
+        if (!parsed.success) return reply(message.id, { isError: true, content: [{ type: "text", text: `Invalid arguments: ${parsed.error.message}` }] });
+        const matches = findLazyTools(parsed.data.query).map((name) => {
+          const tool = ALL_TOOLS[name] as unknown as Bindable;
+          return { name, description: tool.description ?? name, inputSchema: z.toJSONSchema(tool.inputSchema) };
+        });
+        return reply(message.id, { content: [{ type: "text", text: JSON.stringify({ tools: matches }) }] });
       }
-      // Whether the turn read something from outside before this call: what it writes is from outside (issue #136).
-      const outside = !(await ctx.runQuery(internal.codex.outwardAllowed, { turnId: access.turnId }));
-      const acting = outward(name, parsed.data as Record<string, unknown>);
-      if (acting && outside) {
-        return reply(message.id, { content: [{ type: "text", text: JSON.stringify({ refused: true, error: HELD_FOR_OWNER(acting) }) }] });
+      if (lazy && !access.guest && message.params?.name === CALL_TOOL.name) {
+        const parsed = CALL_TOOL.inputSchema.safeParse(message.params?.arguments ?? {});
+        if (!parsed.success) return reply(message.id, { isError: true, content: [{ type: "text", text: `Invalid arguments: ${parsed.error.message}` }] });
+        return callNamedTool(ctx, access, tools, message.id, parsed.data.name as ToolName, parsed.data.arguments ?? {});
       }
-      try {
-        // fromJob marks what a scheduled job's turn saves to memory as the job's; outside, as from outside.
-        const bound = { ...tool, ctx: { ...ctx, userId: access.userId, threadId: access.threadId, fromJob: access.fromJob, conversationId: access.conversationId, outside } };
-        const output = await bound.execute(parsed.data, { toolCallId: String(message.id), messages: [] });
-        // A chat with someone else, read from the owner's own, is what they wrote: outside, like a web page.
-        const theirs = (name === "read_chat" && await ctx.runQuery(internal.contacts.isTheirs, { chatId: String((parsed.data as { chatId?: string }).chatId ?? "") }))
-          // What someone told Perry about themselves is their word too.
-          || ((name === "recall" || name === "brain_search" || name === "search_memory") && Boolean((output as { theySaid?: unknown[] } | null)?.theySaid?.length));
-        if (READS_OUTSIDE.has(name) || theirs) {
-          await ctx.runMutation(internal.codex.markOutside, { turnId: access.turnId });
-          return reply(message.id, { content: [{ type: "text", text: JSON.stringify({ untrusted: UNTRUSTED, result: withHint(output) ?? null }) }] });
-        }
-        return reply(message.id, { content: [{ type: "text", text: JSON.stringify(withHint(output) ?? null) }] });
-      } catch (error) {
-        return toolError(message.id, error);
-      }
+      return callNamedTool(ctx, access, tools, message.id, String(message.params?.name ?? "") as ToolName, (message.params?.arguments ?? {}) as Record<string, unknown>);
     }
     default:
       return fail(message.id, -32601, `Method not found: ${message.method}`);
   }
 });
+
+/** Validate, gate and run one named tool: the body behind a direct tools/call and behind call_tool alike. */
+async function callNamedTool(
+  ctx: ActionCtx,
+  access: { turnId: Id<"codexTurns">; userId: string; threadId: string; fromJob: boolean; conversationId: Id<"conversations">; guest: boolean },
+  allowed: readonly ToolName[],
+  id: RpcMessage["id"],
+  name: ToolName,
+  args: Record<string, unknown>,
+): Promise<Response> {
+  if (!allowed.includes(name) && (access.guest || !OLD_NAMES.includes(name))) return fail(id, -32602, `Unknown tool: ${name}`);
+  const tool = ALL_TOOLS[name] as unknown as Bindable;
+  const parsed = tool.inputSchema.safeParse(args);
+  if (!parsed.success) {
+    return reply(id, { isError: true, content: [{ type: "text", text: `Invalid arguments: ${parsed.error.message}` }] });
+  }
+  // Whether the turn read something from outside before this call: what it writes is from outside (issue #136).
+  const outside = !(await ctx.runQuery(internal.codex.outwardAllowed, { turnId: access.turnId }));
+  const acting = outward(name, parsed.data as Record<string, unknown>);
+  if (acting && outside) {
+    return reply(id, { content: [{ type: "text", text: JSON.stringify({ refused: true, error: HELD_FOR_OWNER(acting) }) }] });
+  }
+  try {
+    // fromJob marks what a scheduled job's turn saves to memory as the job's; outside, as from outside.
+    const bound = { ...tool, ctx: { ...ctx, userId: access.userId, threadId: access.threadId, fromJob: access.fromJob, conversationId: access.conversationId, outside } };
+    const output = await bound.execute(parsed.data, { toolCallId: String(id), messages: [] });
+    // A chat with someone else, read from the owner's own, is what they wrote: outside, like a web page.
+    const theirs = (name === "read_chat" && await ctx.runQuery(internal.contacts.isTheirs, { chatId: String((parsed.data as { chatId?: string }).chatId ?? "") }))
+      // What someone told Perry about themselves is their word too.
+      || ((name === "recall" || name === "brain_search" || name === "search_memory") && Boolean((output as { theySaid?: unknown[] } | null)?.theySaid?.length));
+    if (READS_OUTSIDE.has(name) || theirs) {
+      await ctx.runMutation(internal.codex.markOutside, { turnId: access.turnId });
+      return reply(id, { content: [{ type: "text", text: JSON.stringify({ untrusted: UNTRUSTED, result: withHint(output) ?? null }) }] });
+    }
+    return reply(id, { content: [{ type: "text", text: JSON.stringify(withHint(output) ?? null) }] });
+  } catch (error) {
+    return toolError(id, error);
+  }
+}
